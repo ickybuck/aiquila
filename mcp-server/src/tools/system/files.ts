@@ -3,6 +3,13 @@
 import { z } from 'zod';
 import { getWebDAVClient } from '../../client/webdav.js';
 import { fetchAiquilaAPI } from '../../client/aiquila.js';
+import {
+  extractText,
+  getTikaMaxBytes,
+  isExtractable,
+  isTextLike,
+  isTikaConfigured,
+} from '../../client/tika.js';
 import { PathSchema, FilePathSchema, FileContentSchema, FolderPathSchema } from '../types.js';
 
 /**
@@ -41,7 +48,36 @@ export const listFilesTool = {
 };
 
 /**
- * Read the contents of a file from Nextcloud
+ * Maximum characters returned by a single read_file call. Longer documents are
+ * paged rather than truncated: the response reports the total and the offset to
+ * resume from, so the whole document stays reachable.
+ */
+const DEFAULT_READ_CHAR_LIMIT =
+  parseInt(process.env.MCP_READ_CHAR_LIMIT || '', 10) || 50_000;
+
+export const ReadFileSchema = z.object({
+  path: z.string().describe('The file path in Nextcloud'),
+  offset: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe('Character offset to start from (default 0), for paging long documents'),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe(`Maximum characters to return (default ${DEFAULT_READ_CHAR_LIMIT})`),
+});
+
+/**
+ * Read the contents of a file from Nextcloud.
+ *
+ * Text files are returned directly. Documents (PDF, Word, Excel, PowerPoint,
+ * OpenDocument, RTF, EPUB) and images are sent to Tika for text extraction when
+ * TIKA_URL is set, which also OCRs scans. Other binary files are refused with an
+ * explanation rather than returned as mojibake.
  */
 export const readFileTool = {
   name: 'read_file',
@@ -52,21 +88,58 @@ export const readFileTool = {
     idempotentHint: true,
     openWorldHint: false,
   },
-  description: 'Read the contents of a file from Nextcloud',
-  inputSchema: FilePathSchema,
-  handler: async (args: { path: string }) => {
+  description:
+    'Read the contents of a file from Nextcloud. Text files are returned as-is; PDF, Word, Excel, PowerPoint, OpenDocument and image files are converted to plain text (scanned pages are OCRed). Long documents are paged — use offset with the total reported in the response.',
+  inputSchema: ReadFileSchema,
+  handler: async (args: { path: string; offset?: number; limit?: number }) => {
     const client = getWebDAVClient();
-    const content = await client.getFileContents(args.path, {
-      format: 'text',
-    });
-    return {
-      content: [
-        {
-          type: 'text',
-          text: content as string,
-        },
-      ],
-    };
+    const fail = (text: string) => ({ content: [{ type: 'text', text }], isError: true });
+    let text: string;
+
+    if (isTextLike(args.path)) {
+      text = (await client.getFileContents(args.path, { format: 'text' })) as string;
+    } else if (!isExtractable(args.path)) {
+      return fail(
+        `Cannot read ${args.path} as text: unsupported binary file type. Only text files and documents (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB) or images can be read.`
+      );
+    } else if (!isTikaConfigured()) {
+      return fail(
+        `Cannot extract text from ${args.path}: TIKA_URL is not configured. Without it this file type would return unusable bytes rather than text.`
+      );
+    } else {
+      const data = (await client.getFileContents(args.path, {
+        format: 'binary',
+      })) as Uint8Array;
+      const maxBytes = getTikaMaxBytes();
+      if (data.byteLength > maxBytes) {
+        return fail(
+          `Refusing to extract ${args.path}: ${data.byteLength} bytes exceeds the ${maxBytes}-byte limit (TIKA_MAX_BYTES).`
+        );
+      }
+      try {
+        text = await extractText(data, args.path);
+      } catch (error) {
+        return fail(
+          `Text extraction failed for ${args.path}: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+      if (text.trim().length === 0) {
+        return fail(
+          `No text could be extracted from ${args.path}. For a scanned document this usually means OCR is unavailable or produced no output.`
+        );
+      }
+    }
+
+    const totalChars = text.length;
+    const offset = args.offset ?? 0;
+    const slice = text.slice(offset, offset + (args.limit ?? DEFAULT_READ_CHAR_LIMIT));
+    const end = offset + slice.length;
+    const trailer =
+      end < totalChars
+        ? `\n\n[Returned characters ${offset}–${end} of ${totalChars}. Call read_file again with offset=${end} to continue.]`
+        : '';
+
+    return { content: [{ type: 'text', text: slice + trailer }] };
   },
 };
 
