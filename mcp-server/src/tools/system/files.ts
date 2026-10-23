@@ -9,6 +9,7 @@ import {
   isExtractable,
   isTextLike,
   isTikaConfigured,
+  looksLikeText,
 } from '../../client/tika.js';
 import { PathSchema, FilePathSchema, FileContentSchema, FolderPathSchema } from '../types.js';
 
@@ -98,15 +99,12 @@ export const readFileTool = {
 
     if (isTextLike(args.path)) {
       text = (await client.getFileContents(args.path, { format: 'text' })) as string;
-    } else if (!isExtractable(args.path)) {
-      return fail(
-        `Cannot read ${args.path} as text: unsupported binary file type. Only text files and documents (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB) or images can be read.`
-      );
-    } else if (!isTikaConfigured()) {
-      return fail(
-        `Cannot extract text from ${args.path}: TIKA_URL is not configured. Without it this file type would return unusable bytes rather than text.`
-      );
-    } else {
+    } else if (isExtractable(args.path)) {
+      if (!isTikaConfigured()) {
+        return fail(
+          `Cannot extract text from ${args.path}: TIKA_URL is not configured. Without it this file type would return unusable bytes rather than text.`
+        );
+      }
       const data = (await client.getFileContents(args.path, {
         format: 'binary',
       })) as Uint8Array;
@@ -128,6 +126,18 @@ export const readFileTool = {
           `No text could be extracted from ${args.path}. For a scanned document this usually means OCR is unavailable or produced no output.`
         );
       }
+    } else {
+      // Unrecognised extension: sniff the bytes rather than refusing outright,
+      // so files like .pem, .lst, .srt or .ics keep returning text.
+      const data = (await client.getFileContents(args.path, {
+        format: 'binary',
+      })) as Uint8Array;
+      if (!looksLikeText(data)) {
+        return fail(
+          `Cannot read ${args.path} as text: the file appears to be binary and is not a supported document type (PDF, Word, Excel, PowerPoint, OpenDocument, RTF, EPUB) or image.`
+        );
+      }
+      text = new TextDecoder('utf-8').decode(data);
     }
 
     const totalChars = text.length;

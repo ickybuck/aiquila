@@ -156,3 +156,24 @@ export async function extractText(data: Uint8Array, path: string): Promise<strin
   );
   return text;
 }
+
+/**
+ * Heuristic test for whether bytes are text rather than binary.
+ *
+ * Used when the extension is unrecognised, so files such as .pem, .lst, .srt or
+ * .ics are still returned as text instead of being refused. An extension
+ * whitelist alone would regress those: they read fine today.
+ */
+export function looksLikeText(data: Uint8Array): boolean {
+  const sample = data.subarray(0, Math.min(data.byteLength, 8192));
+  if (sample.byteLength === 0) return true;
+
+  let suspicious = 0;
+  for (const byte of sample) {
+    // A NUL byte effectively never occurs in UTF-8 text.
+    if (byte === 0) return false;
+    // Control characters other than tab, LF, VT, FF and CR.
+    if (byte < 0x09 || (byte > 0x0d && byte < 0x20)) suspicious++;
+  }
+  return suspicious / sample.byteLength < 0.05;
+}
